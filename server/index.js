@@ -4,7 +4,6 @@ import multer from 'multer';
 import sharp from 'sharp';
 import OpenAI from 'openai';
 import { z } from 'zod';
-import { zodTextFormat } from 'openai/helpers/zod';
 import { calculateGrade, centeringRatio } from './grading.js';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
@@ -30,26 +29,37 @@ app.post('/api/grade',upload.array('photos',8),async(req,res)=>{
   if(!files.length) return res.status(400).json({error:'Upload at least one JPEG, PNG or WebP image.'});
   const roles=JSON.parse(req.body.roles||'[]');
   if(!Array.isArray(roles)||roles.length!==files.length||roles.some(r=>!['front','back','detail'].includes(r))) return res.status(400).json({error:'Each photo needs a front, back or detail label.'});
-  const content=[{type:'input_text',text:`Inspect the same Pokémon card across ${files.length} photos. The image roles in order are: ${roles.join(', ')}. Index each photo from 0. For detail images, use their defect evidence but only measure centering from front or back full-card images. Assess all six grading dimensions. Full-card image crops may vary; never measure outside margins as card borders.`}];
+  const content=[{type:'text',text:`Inspect the same Pokémon card across ${files.length} photos. The image roles in order are: ${roles.join(', ')}. Index each photo from 0. For detail images, use their defect evidence but only measure centering from front or back full-card images. Assess all six grading dimensions. Full-card image crops may vary; never measure outside margins as card borders. Return ONLY valid JSON matching this exact shape: {\"cardName\":string,\"imageQualityScore\":number,\"frontBorders\":{\"left\":number|null,\"right\":number|null,\"top\":number|null,\"bottom\":number|null,\"quality\":\"measurable\"|\"approximate\"|\"unavailable\"},\"backBorders\":same,\"defects\":[{\"imageIndex\":number,\"category\":\"corner\"|\"edge\"|\"surface\",\"severity\":\"minor\"|\"moderate\"|\"major\"|\"critical\",\"label\":string,\"explanation\":string,\"box\":{\"x\":number,\"y\":number,\"w\":number,\"h\":number},\"visibility\":\"clear\"|\"possible\"}],\"observations\":[{\"imageIndex\":number,\"notes\":string,\"quality\":\"good\"|\"fair\"|\"poor\"}],\"warnings\":[string],\"explanation\":string,\"overallCondition\":string,\"suspectedAlteration\":boolean}. Do not wrap JSON in markdown fences.`}];
   for(let i=0;i<files.length;i++){
    const file=files[i];
    let processed;
    try {processed=await sharp(file.buffer,{limitInputPixels:35_000_000}).rotate().resize({width:1600,height:1600,fit:'inside',withoutEnlargement:true}).jpeg({quality:87}).toBuffer();}
    catch{return res.status(400).json({error:`Could not decode image ${i+1}.`});}
-   content.push({type:'input_text',text:`PHOTO INDEX ${i}; ROLE ${roles[i]}`},{type:'input_image',image_url:`data:image/jpeg;base64,${processed.toString('base64')}`,detail:'high'});
+   content.push({type:'text',text:`PHOTO INDEX ${i}; ROLE ${roles[i]}`},{type:'image_url',image_url:{url:`data:image/jpeg;base64,${processed.toString('base64')}`,detail:'high'}});
   }
   const client=new OpenAI({
    apiKey:process.env.OPENAI_API_KEY,
    ...(process.env.OPENAI_BASE_URL ? {baseURL:process.env.OPENAI_BASE_URL} : {})
   });
-  const response=await client.responses.parse({model:process.env.OPENAI_MODEL||'gpt-6.1-sol',instructions:SYSTEM,input:[{role:'user',content}],text:{format:zodTextFormat(Vision,'card_inspection')},max_output_tokens:3500});
-  const v=response.output_parsed;
+  const response=await client.chat.completions.create({
+   model:process.env.OPENAI_MODEL||'MiniMax-M3',
+   messages:[{role:'system',content:SYSTEM},{role:'user',content}],
+   response_format:{type:'json_object'},
+   max_tokens:3500
+  });
+  const raw=response.choices?.[0]?.message?.content;
+  if(!raw) return res.status(502).json({error:'The model did not return a usable visual inspection.'});
+  let parsed;
+  try { parsed=JSON.parse(raw); } catch { return res.status(502).json({error:'The model returned invalid JSON.'}); }
+  const checked=Vision.safeParse(parsed);
+  if(!checked.success){ console.error('Vision schema failure:',checked.error.message); return res.status(502).json({error:'The model response did not match the expected grading schema.'}); }
+  const v=checked.data;
   if(!v) return res.status(502).json({error:'The model did not return a usable visual inspection.'});
   const defects=v.defects.filter(d=>d.imageIndex>=0&&d.imageIndex<files.length).map(d=>({...d,box:{x:Math.max(0,Math.min(1,d.box.x)),y:Math.max(0,Math.min(1,d.box.y)),w:Math.max(0,Math.min(1-d.box.x,d.box.w)),h:Math.max(0,Math.min(1-d.box.y,d.box.h))}}));
   const centering={front:fmtBorder(v.frontBorders,'front'),back:fmtBorder(v.backBorders,'back')};
   const result=calculateGrade({...v,defects,centering},roles);
   if(v.suspectedAlteration) result.warnings.unshift('Possible alteration detected: a professional authenticity and alteration check is needed.');
-  res.json({...result,centering,defects,observations:v.observations,cardName:v.cardName,explanation:v.explanation,overallCondition:v.overallCondition,imageQualityScore:v.imageQualityScore,engine:'openai-vision + transparent rules',disclaimer:'PSA is a trademark of Collectors Universe, Inc. This independent tool is not affiliated with or endorsed by PSA.'});
+  res.json({...result,centering,defects,observations:v.observations,cardName:v.cardName,explanation:v.explanation,overallCondition:v.overallCondition,imageQualityScore:v.imageQualityScore,engine:'openai-compatible vision + transparent rules',disclaimer:'PSA is a trademark of Collectors Universe, Inc. This independent tool is not affiliated with or endorsed by PSA.'});
  }catch(err){console.error('Grading failure:',err?.message);res.status(500).json({error:'Unable to analyze the photographs. Check server configuration or try again.'});}
 });
 if(process.env.NODE_ENV==='production'){
