@@ -22,6 +22,23 @@ function fmtBorder(b,side){
   return {side,quality:b.quality,horizontal,vertical};
 }
 app.get('/api/health',(_req,res)=>res.json({ok:true,configured:!!process.env.OPENAI_API_KEY}));
+app.get('/api/provider-check',async(_req,res)=>{
+ try{
+  if(!process.env.OPENAI_API_KEY) return res.status(503).json({ok:false,error:'missing_api_key'});
+  const client=new OpenAI({apiKey:process.env.OPENAI_API_KEY,...(process.env.OPENAI_BASE_URL?{baseURL:process.env.OPENAI_BASE_URL}:{})});
+  const response=await client.chat.completions.create({
+   model:process.env.OPENAI_MODEL||'MiniMax-M3.1-Flash',
+   messages:[{role:'user',content:'Reply with exactly: OK'}],
+   max_tokens:8,
+   temperature:0
+  });
+  const text=response.choices?.[0]?.message?.content?.trim()||'';
+  res.json({ok:true,model:process.env.OPENAI_MODEL||null,response:text.slice(0,50)});
+ }catch(err){
+  console.error('Provider check failure:',err?.status||'',err?.message);
+  res.status(502).json({ok:false,status:err?.status||null,error:String(err?.message||'provider_error').slice(0,200)});
+ }
+});
 app.post('/api/grade',upload.array('photos',8),async(req,res)=>{
  try{
   if(!process.env.OPENAI_API_KEY) return res.status(503).json({error:'AI service not configured. Add OPENAI_API_KEY to .env on the server.'});
